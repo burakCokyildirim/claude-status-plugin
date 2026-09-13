@@ -92,6 +92,7 @@ The daemon reads JSONL lines and derives state. Key patterns:
 - `type:"assistant"` + `stop_reason:"end_turn"` → question detection or idle (unless agents active)
 - `type:"user"` with text content → `active` / `"thinking"`
 - `type:"user"` with `tool_result` → removes agent from tracking set
+- `type:"user"` with the `tool_result` for the call a permission prompt is holding → ends `waiting` (the answer lets the call run, so its result is the first sign the user responded; see `awaiting_permission_for`)
 - `type:"progress"` → `active` with activity (subagent/bash/mcp)
 - `agentId` starting with `"acompact-"` → `compacting` (any event type)
 - `type:"system"` + `subtype:"compact_boundary"` → `idle` (compaction finished)

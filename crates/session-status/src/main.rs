@@ -164,6 +164,32 @@ impl StatusInfo {
 // JSONL-driven state machine
 // ---------------------------------------------------------------------------
 
+/// Stopping a turn writes one of these where the model or a tool would have spoken:
+/// "[Request interrupted by user]", or "... for tool use" when a tool was running.
+fn is_interrupt_marker(text: &str) -> bool {
+    text.trim_start()
+        .starts_with("[Request interrupted by user")
+}
+
+fn block_is_interrupt(block: &Value) -> bool {
+    match block.get("type").and_then(|t| t.as_str()) {
+        Some("text") => block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(is_interrupt_marker),
+        Some("tool_result") => match block.get("content") {
+            Some(Value::String(text)) => is_interrupt_marker(text),
+            Some(Value::Array(parts)) => parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(is_interrupt_marker)
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 struct DaemonState {
     state: SessionState,
     activity: String,
@@ -414,6 +440,24 @@ impl DaemonState {
         }
 
         self.event = "user".to_string();
+
+        // A stop is recorded as a user line that carries a promptId, so it would
+        // otherwise read as a fresh prompt and leave the session "thinking" with
+        // nothing left to answer it — or, at a permission prompt, as the prompt
+        // being answered. The turn is over.
+        let interrupted = content.iter().any(block_is_interrupt)
+            || message
+                .get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_interrupt_marker);
+        if interrupted {
+            self.active_agents.clear();
+            self.open_tool_calls.clear();
+            self.awaiting_permission_for = None;
+            self.state = SessionState::Idle;
+            self.activity = String::new();
+            return;
+        }
 
         // Only transition to "thinking" for real user prompts (which have promptId).
         // Local command output (e.g. /plugin, /reload-plugins) generates user messages
@@ -1606,6 +1650,76 @@ mod tests {
         assert_eq!(s.activity, "thinking");
         assert!(s.open_tool_calls.is_empty());
         assert!(s.awaiting_permission_for.is_none());
+    }
+
+    // -- Stopped turns --
+
+    fn make_interrupted_tool_result(tool_use_id: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "promptId": "test-prompt-id",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tool_use_id, "is_error": true,
+                     "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}
+                ],
+                "role": "user"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn stopping_a_reply_ends_the_turn() {
+        // Stop is recorded as a user line with a promptId; read as a new prompt it
+        // left the session "thinking" with nothing left to answer it
+        let mut s = DaemonState::new();
+        s.process_line(&make_user_text("do the thing"));
+        assert_eq!(s.state, SessionState::Active);
+
+        assert!(s.process_line(&make_user_text("[Request interrupted by user]")));
+        assert_eq!(s.state, SessionState::Idle);
+        assert_eq!(s.activity, "");
+    }
+
+    #[test]
+    fn stopping_a_tool_ends_the_turn() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_line(&make_user_text(
+            "[Request interrupted by user for tool use]",
+        ));
+        assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn a_stop_recorded_as_a_tool_result_ends_the_turn() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_agent_spawn("toolu_agent"));
+        s.process_line(&make_interrupted_tool_result("toolu_agent"));
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(s.active_agents.is_empty());
+    }
+
+    #[test]
+    fn stopping_at_a_permission_prompt_ends_the_turn_instead_of_resuming_it() {
+        // The stopped call's result would otherwise read as the prompt being answered
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_signal(&serde_json::json!({"type": "permission_request", "tool_name": "Bash"}));
+        s.process_line(&make_interrupted_tool_result("toolu_bash"));
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(s.awaiting_permission_for.is_none());
+    }
+
+    #[test]
+    fn a_prompt_after_a_stop_starts_a_new_turn() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_user_text("first"));
+        s.process_line(&make_user_text("[Request interrupted by user]"));
+        s.process_line(&make_user_text("second"));
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "thinking");
     }
 
     #[test]

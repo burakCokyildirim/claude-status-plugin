@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CString;
 use std::fs;
@@ -164,6 +164,32 @@ impl StatusInfo {
 // JSONL-driven state machine
 // ---------------------------------------------------------------------------
 
+/// Stopping a turn writes one of these where the model or a tool would have spoken:
+/// "[Request interrupted by user]", or "... for tool use" when a tool was running.
+fn is_interrupt_marker(text: &str) -> bool {
+    text.trim_start()
+        .starts_with("[Request interrupted by user")
+}
+
+fn block_is_interrupt(block: &Value) -> bool {
+    match block.get("type").and_then(|t| t.as_str()) {
+        Some("text") => block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(is_interrupt_marker),
+        Some("tool_result") => match block.get("content") {
+            Some(Value::String(text)) => is_interrupt_marker(text),
+            Some(Value::Array(parts)) => parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(is_interrupt_marker)
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 struct DaemonState {
     state: SessionState,
     activity: String,
@@ -173,6 +199,13 @@ struct DaemonState {
     /// Set when compact_boundary fires. Suppresses state changes from replayed
     /// context (user messages, progress) until the next real assistant response.
     compacting: bool,
+    /// Tool calls the model has made that have not reported back, by id, with the
+    /// tool's name. Results arrive one per call as each one finishes, so this is
+    /// what ties a result to the call a prompt was holding up.
+    open_tool_calls: HashMap<String, String>,
+    /// The tool a permission prompt is waiting on. Answering the prompt lets that
+    /// call run, and its result is the first thing the transcript records.
+    awaiting_permission_for: Option<String>,
 }
 
 impl DaemonState {
@@ -184,6 +217,8 @@ impl DaemonState {
             active_agents: HashSet::new(),
             session_name: None,
             compacting: false,
+            open_tool_calls: HashMap::new(),
+            awaiting_permission_for: None,
         }
     }
 
@@ -267,18 +302,23 @@ impl DaemonState {
             .and_then(|c| c.as_array())
             .unwrap_or(&empty_content);
 
-        // Track agent spawns — look for tool_use blocks with name "Agent"
+        // Track tool calls, and the agent spawns among them
         for block in content {
             let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if block_type == "tool_use" {
+            if block_type == "tool_use"
+                && let Some(id) = block.get("id").and_then(|i| i.as_str())
+            {
                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if name == "Agent"
-                    && let Some(id) = block.get("id").and_then(|i| i.as_str())
-                {
+                if name == "Agent" {
                     self.active_agents.insert(id.to_string());
                 }
+                self.open_tool_calls
+                    .insert(id.to_string(), name.to_string());
             }
         }
+
+        // The model is speaking again, so any prompt it was held on has been answered.
+        self.awaiting_permission_for = None;
 
         self.event = "assistant".to_string();
 
@@ -360,15 +400,20 @@ impl DaemonState {
         // Check for tool_result blocks — may complete an agent
         let mut has_tool_result = false;
         let mut has_text = false;
+        let mut answered_prompt = false;
         for block in content {
             let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match block_type {
                 "tool_result" => {
                     has_tool_result = true;
-                    if !is_async
-                        && let Some(tool_use_id) = block.get("tool_use_id").and_then(|i| i.as_str())
-                    {
-                        self.active_agents.remove(tool_use_id);
+                    if let Some(tool_use_id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+                        if !is_async {
+                            self.active_agents.remove(tool_use_id);
+                        }
+                        let tool = self.open_tool_calls.remove(tool_use_id);
+                        if tool.is_some() && tool == self.awaiting_permission_for {
+                            answered_prompt = true;
+                        }
                     }
                 }
                 "text" => {
@@ -396,6 +441,24 @@ impl DaemonState {
 
         self.event = "user".to_string();
 
+        // A stop is recorded as a user line that carries a promptId, so it would
+        // otherwise read as a fresh prompt and leave the session "thinking" with
+        // nothing left to answer it — or, at a permission prompt, as the prompt
+        // being answered. The turn is over.
+        let interrupted = content.iter().any(block_is_interrupt)
+            || message
+                .get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_interrupt_marker);
+        if interrupted {
+            self.active_agents.clear();
+            self.open_tool_calls.clear();
+            self.awaiting_permission_for = None;
+            self.state = SessionState::Idle;
+            self.activity = String::new();
+            return;
+        }
+
         // Only transition to "thinking" for real user prompts (which have promptId).
         // Local command output (e.g. /plugin, /reload-plugins) generates user messages
         // without promptId that should not change state.
@@ -405,10 +468,20 @@ impl DaemonState {
             // A new user prompt means any pending agents from the previous
             // turn were cancelled/interrupted — clear stale tracking.
             self.active_agents.clear();
+            self.open_tool_calls.clear();
+            self.awaiting_permission_for = None;
             self.state = SessionState::Active;
             self.activity = "thinking".to_string();
+        } else if answered_prompt && self.state == SessionState::Waiting {
+            // The call a permission prompt was holding up has reported back: the
+            // user answered and the model is already working on the result.
+            // Waiting for its next line instead would keep the session showing
+            // as blocked on the user for as long as the model takes to respond.
+            self.awaiting_permission_for = None;
+            self.state = SessionState::Active;
+            self.activity = String::new();
         }
-        // tool_result-only messages don't change state (the assistant response will)
+        // Other tool_result-only messages don't change state (the assistant response will)
     }
 
     fn process_progress(&mut self, v: &Value) {
@@ -499,6 +572,12 @@ impl DaemonState {
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
                     .to_string();
+                // The Notification hook announces the same prompt a few seconds
+                // later without naming the tool, so a nameless signal keeps the
+                // tool the prompt is already known to be holding.
+                if !tool_name.is_empty() {
+                    self.awaiting_permission_for = Some(tool_name.clone());
+                }
                 self.state = SessionState::Waiting;
                 self.activity = tool_name;
                 self.event = "permission_request".to_string();
@@ -1485,6 +1564,162 @@ mod tests {
         assert!(s.process_signal(&signal));
         assert_eq!(s.state, SessionState::Waiting);
         assert_eq!(s.activity, "");
+    }
+
+    // -- Answered permission prompts --
+
+    #[test]
+    fn answering_a_permission_prompt_ends_waiting() {
+        // AskUserQuestion is held by a permission prompt, and the answer comes back
+        // as that tool's result, not as a prompt the user typed
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("AskUserQuestion", "toolu_ask"));
+        let signal =
+            serde_json::json!({"type": "permission_request", "tool_name": "AskUserQuestion"});
+        s.process_signal(&signal);
+        assert_eq!(s.state, SessionState::Waiting);
+
+        assert!(s.process_line(&make_tool_result("toolu_ask")));
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "");
+    }
+
+    #[test]
+    fn a_nameless_notification_keeps_the_prompt_it_announces() {
+        // The Notification hook repeats the prompt a few seconds later without the
+        // tool's name; the answer must still end the wait
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_signal(&serde_json::json!({"type": "permission_request", "tool_name": "Bash"}));
+        s.process_signal(&serde_json::json!({"type": "permission_request"}));
+        assert_eq!(s.state, SessionState::Waiting);
+
+        s.process_line(&make_tool_result("toolu_bash"));
+        assert_eq!(s.state, SessionState::Active);
+    }
+
+    #[test]
+    fn another_call_reporting_back_keeps_waiting() {
+        // Results for parallel calls land one at a time, so a call that needed no
+        // permission finishing first says nothing about the prompt
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Read", "toolu_read"));
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_signal(&serde_json::json!({"type": "permission_request", "tool_name": "Bash"}));
+
+        s.process_line(&make_tool_result("toolu_read"));
+        assert_eq!(s.state, SessionState::Waiting);
+
+        s.process_line(&make_tool_result("toolu_bash"));
+        assert_eq!(s.state, SessionState::Active);
+    }
+
+    #[test]
+    fn a_question_is_not_ended_by_a_tool_result() {
+        // A question at the end of a turn waits for a typed reply; a call reporting
+        // back in the meantime is not that reply
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_line(&make_end_turn("Shall I continue?"));
+        assert_eq!(s.state, SessionState::Waiting);
+
+        s.process_line(&make_tool_result("toolu_bash"));
+        assert_eq!(s.state, SessionState::Waiting);
+        assert_eq!(s.activity, "question");
+    }
+
+    #[test]
+    fn a_result_while_working_changes_nothing() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        assert!(!s.process_line(&make_tool_result("toolu_bash")));
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "Bash");
+    }
+
+    #[test]
+    fn a_real_prompt_forgets_calls_that_never_reported_back() {
+        // Typing a new message abandons the call a prompt was holding, so nothing
+        // about it may linger into the next turn
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_signal(&serde_json::json!({"type": "permission_request", "tool_name": "Bash"}));
+        s.process_line(&make_user_text("never mind, do something else"));
+
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "thinking");
+        assert!(s.open_tool_calls.is_empty());
+        assert!(s.awaiting_permission_for.is_none());
+    }
+
+    // -- Stopped turns --
+
+    fn make_interrupted_tool_result(tool_use_id: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "promptId": "test-prompt-id",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tool_use_id, "is_error": true,
+                     "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}
+                ],
+                "role": "user"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn stopping_a_reply_ends_the_turn() {
+        // Stop is recorded as a user line with a promptId; read as a new prompt it
+        // left the session "thinking" with nothing left to answer it
+        let mut s = DaemonState::new();
+        s.process_line(&make_user_text("do the thing"));
+        assert_eq!(s.state, SessionState::Active);
+
+        assert!(s.process_line(&make_user_text("[Request interrupted by user]")));
+        assert_eq!(s.state, SessionState::Idle);
+        assert_eq!(s.activity, "");
+    }
+
+    #[test]
+    fn stopping_a_tool_ends_the_turn() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_line(&make_user_text(
+            "[Request interrupted by user for tool use]",
+        ));
+        assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn a_stop_recorded_as_a_tool_result_ends_the_turn() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_agent_spawn("toolu_agent"));
+        s.process_line(&make_interrupted_tool_result("toolu_agent"));
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(s.active_agents.is_empty());
+    }
+
+    #[test]
+    fn stopping_at_a_permission_prompt_ends_the_turn_instead_of_resuming_it() {
+        // The stopped call's result would otherwise read as the prompt being answered
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_tool_use("Bash", "toolu_bash"));
+        s.process_signal(&serde_json::json!({"type": "permission_request", "tool_name": "Bash"}));
+        s.process_line(&make_interrupted_tool_result("toolu_bash"));
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(s.awaiting_permission_for.is_none());
+    }
+
+    #[test]
+    fn a_prompt_after_a_stop_starts_a_new_turn() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_user_text("first"));
+        s.process_line(&make_user_text("[Request interrupted by user]"));
+        s.process_line(&make_user_text("second"));
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "thinking");
     }
 
     #[test]
